@@ -188,19 +188,6 @@ function enhance(c) {
   ctx.putImageData(d, 0, 0);
   return c;
 }
-// 從原圖裁一塊 (sx,sy,sw,sh)，縮放到指定高度，四周補白邊
-function cropCanvas(img, sx, sy, sw, sh, targetH, pad = 20) {
-  const s = targetH / sh;
-  const c = document.createElement('canvas');
-  c.width = Math.round(sw * s) + pad * 2;
-  c.height = Math.round(sh * s) + pad * 2;
-  const ctx = c.getContext('2d');
-  ctx.fillStyle = '#fff';
-  ctx.fillRect(0, 0, c.width, c.height);
-  ctx.imageSmoothingQuality = 'high';
-  ctx.drawImage(img, sx, sy, sw, sh, pad, pad, c.width - pad * 2, c.height - pad * 2);
-  return enhance(c);
-}
 // 整張照片（長邊約 1200～2000px）
 function fullCanvas(img) {
   const longSide = Math.max(img.naturalWidth, img.naturalHeight);
@@ -212,8 +199,12 @@ function fullCanvas(img) {
   return enhance(c);
 }
 
-// 用顏色找出黃色資產標籤，回傳在縮圖上的外框 {x,y,w,h}
-function findLabelBox(px, w, h) {
+/**
+ * 用顏色找出黃色資產標籤（可旋轉、歪斜）。
+ * 以影像矩（moments）算出色塊的中心、長短邊與傾斜角度。
+ * 回傳縮圖座標 { cx, cy, w, h, angle }，w 為長邊、angle 為長邊的角度（弧度）
+ */
+function findLabel(px, w, h) {
   const mask = new Uint8Array(w * h);
   for (let i = 0, j = 0; j < w * h; i += 4, j++) {
     const r = px[i], g = px[i + 1], b = px[i + 2];
@@ -224,55 +215,102 @@ function findLabelBox(px, w, h) {
   let best = null;
   for (let s = 0; s < w * h; s++) {
     if (!mask[s] || seen[s]) continue;
-    let x0 = w, y0 = h, x1 = 0, y1 = 0, area = 0;
+    let n = 0, sx = 0, sy = 0, sxx = 0, syy = 0, sxy = 0;
     stack.push(s); seen[s] = 1;
     while (stack.length) {
       const p = stack.pop(), x = p % w, y = (p / w) | 0;
-      area++;
-      if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+      n++; sx += x; sy += y; sxx += x * x; syy += y * y; sxy += x * y;
       const nb = [x > 0 ? p - 1 : -1, x < w - 1 ? p + 1 : -1, p - w, p + w];
       for (const q of nb) {
         if (q < 0 || q >= w * h || seen[q] || !mask[q]) continue;
         seen[q] = 1; stack.push(q);
       }
     }
-    const bw = x1 - x0 + 1, bh = y1 - y0 + 1;
-    // 面積夠大、橫向長方形、填滿度夠，才像一張標籤
-    if (area < w * h * 0.003 || bw < bh * 1.2 || area / (bw * bh) < 0.4) continue;
-    if (!best || area > best.area) best = { x: x0, y: y0, w: bw, h: bh, area };
+    if (n < w * h * 0.002) continue;
+    const cx = sx / n, cy = sy / n;
+    const mxx = sxx / n - cx * cx, myy = syy / n - cy * cy, mxy = sxy / n - cx * cy;
+    const common = Math.sqrt(((mxx - myy) / 2) ** 2 + mxy ** 2);
+    const l1 = (mxx + myy) / 2 + common, l2 = (mxx + myy) / 2 - common;
+    if (l2 <= 0) continue;
+    const L = Math.sqrt(12 * l1), S = Math.sqrt(12 * l2); // 均勻長方形：變異數 = 邊長² / 12
+    // 長寬比像標籤、且色塊大致填滿那個長方形（排除黃色桌面、牆面等大片雜訊）
+    if (L / S < 1.5 || L / S > 8 || n / (L * S) < 0.45) continue;
+    if (!best || n > best.n) best = { cx, cy, w: L, h: S, angle: 0.5 * Math.atan2(2 * mxy, mxx - myy), n };
   }
   return best;
 }
 function detectLabel(img) {
-  const SW = 400, s = SW / img.naturalWidth;
+  const SW = 400, s = SW / Math.max(img.naturalWidth, img.naturalHeight);
   const c = document.createElement('canvas');
-  c.width = SW; c.height = Math.round(img.naturalHeight * s);
+  c.width = Math.round(img.naturalWidth * s); c.height = Math.round(img.naturalHeight * s);
   const ctx = c.getContext('2d', { willReadFrequently: true });
   ctx.drawImage(img, 0, 0, c.width, c.height);
-  const b = findLabelBox(ctx.getImageData(0, 0, c.width, c.height).data, c.width, c.height);
-  return b && { x: b.x / s, y: b.y / s, w: b.w / s, h: b.h / s }; // 換算回原圖座標
+  const b = findLabel(ctx.getImageData(0, 0, c.width, c.height).data, c.width, c.height);
+  return b && { cx: b.cx / s, cy: b.cy / s, w: b.w / s, h: b.h / s, angle: b.angle }; // 換算回原圖座標
+}
+
+// 把標籤轉正（長邊水平），flip=true 時再轉 180°（處理上下顛倒）
+// 回傳只含指定區域的畫布：yFrom~yTo 為標籤高度的比例（0=頂端，1=底端）
+// labelH：轉正後標籤的高度(px)；220 時文字列約 120px，是 Tesseract 最準的字高
+function uprightCrop(img, L, flip, yFrom, yTo, LABEL_H = 220, pad = 20) {
+  const s = LABEL_H / L.h;
+  const cw = Math.round(L.w * 1.08 * s), ch = Math.round(LABEL_H * (yTo - yFrom));
+  const c = document.createElement('canvas');
+  c.width = cw + pad * 2; c.height = ch + pad * 2;
+  const ctx = c.getContext('2d');
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(0, 0, c.width, c.height);
+  ctx.save();
+  ctx.beginPath(); ctx.rect(pad, pad, cw, ch); ctx.clip();
+  // 讓標籤中心對到畫布上對應的位置，再旋轉、縮放
+  ctx.translate(pad + cw / 2, pad + LABEL_H * (0.5 - yFrom));
+  ctx.rotate(-(L.angle + (flip ? Math.PI : 0)));
+  ctx.scale(s, s);
+  ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(img, -L.cx, -L.cy);
+  ctx.restore();
+  return enhance(c);
+}
+// 整張照片旋轉 90° / 270°（找不到標籤時的備案）
+function rotatedFull(img, deg) {
+  const base = fullCanvas(img);
+  const c = document.createElement('canvas');
+  c.width = base.height; c.height = base.width;
+  const ctx = c.getContext('2d');
+  ctx.translate(c.width / 2, c.height / 2);
+  ctx.rotate((deg * Math.PI) / 180);
+  ctx.drawImage(base, -base.width / 2, -base.height / 2);
+  return c;
 }
 
 /**
- * 依序產生要嘗試的 OCR 輸入：
- * 有找到黃色標籤 → 先辨識標籤上半部的文字列（避開條碼），再辨識整張標籤
- * 最後才退回整張照片
+ * 依序產生要嘗試的 OCR 輸入，比對成功就停：
+ * 有找到黃色標籤 → 轉正後辨識上半部文字列（避開條碼），正反兩個方向都試，再試整張標籤
+ * 找不到標籤 → 整張照片，含旋轉 90° / 270°
  */
 function buildAttempts(img) {
   const attempts = [];
-  const b = detectLabel(img);
-  if (b) {
-    const textRow = (H) => () => cropCanvas(img, b.x, b.y, b.w, b.h * 0.55, H);
-    attempts.push({ name: '標籤文字列', psm: '7', make: textRow(120) });
-    attempts.push({ name: '標籤文字列(小)', psm: '6', make: textRow(90) });
-    const p = b.h * 0.15;
-    const x = Math.max(0, b.x - p), y = Math.max(0, b.y - p);
-    const w = Math.min(img.naturalWidth - x, b.w + p * 2), h = Math.min(img.naturalHeight - y, b.h + p * 2);
-    attempts.push({ name: '整張標籤', psm: '6', make: () => cropCanvas(img, x, y, w, h, Math.round((1400 / w) * h)) });
+  const L = detectLabel(img);
+  if (L) {
+    const deg = Math.round((L.angle * 180) / Math.PI);
+    // 文字列用兩種大小試，同一個字在不同大小下常常一個讀錯、一個讀對
+    for (const size of [220, 170]) {
+      for (const flip of [false, true]) {
+        const tag = `標籤文字列 ${deg}°${flip ? '+180°' : ''}${size === 220 ? '' : ' (小)'}`;
+        attempts.push({ name: tag, psm: '7', make: () => uprightCrop(img, L, flip, -0.05, 0.55, size) });
+      }
+    }
+    for (const flip of [false, true]) {
+      attempts.push({ name: `整張標籤${flip ? ' +180°' : ''}`, psm: '6', make: () => uprightCrop(img, L, flip, -0.15, 1.15) });
+    }
   }
   let full = null;
   const fullOnce = () => (full = full || fullCanvas(img));
   attempts.push({ name: '整張照片', psm: '6', make: fullOnce });
+  if (!L) {
+    attempts.push({ name: '整張照片 90°', psm: '6', make: () => rotatedFull(img, 90) });
+    attempts.push({ name: '整張照片 270°', psm: '6', make: () => rotatedFull(img, 270) });
+  }
   attempts.push({ name: '整張照片(零散)', psm: '11', make: fullOnce });
   return attempts;
 }
@@ -334,11 +372,36 @@ function matchAsset(text) {
   return { asset: sorted[0][0], code: PREFIX + digitPart(sorted[0][0].assetId) };
 }
 
+/**
+ * 近似比對：數字段只差 1 碼、且清單中只有一筆符合 → 回傳 { near, read }
+ * 不自動判定為盤點完成，交由使用者確認（避免把別台資產記成自己的）
+ */
+function nearMatch(text) {
+  const hits = new Map(); // asset → 讀到的編號
+  for (const line of String(text).split(/\n+/)) {
+    for (const run of toDigits(line).match(/\d+/g) || []) {
+      for (let i = 0; i + NDIG <= run.length; i++) {
+        const win = run.slice(i, i + NDIG);
+        for (const a of assets) {
+          const d = digitPart(a.assetId);
+          if (d.length !== NDIG) continue;
+          let diff = 0;
+          for (let k = 0; k < NDIG && diff < 2; k++) if (d[k] !== win[k]) diff++;
+          if (diff === 1 && !hits.has(a)) hits.set(a, PREFIX + win);
+        }
+      }
+    }
+  }
+  if (hits.size !== 1) return null;
+  const [[asset, read]] = [...hits];
+  return { near: asset, read };
+}
+
 // 依序嘗試各種裁切與版面模式，比對到就停
 async function recognizeAsset(img) {
   const worker = await getWorker();
   const texts = [];
-  let ambiguous = null;
+  let ambiguous = null, near = null;
   for (const a of buildAttempts(img)) {
     await worker.setParameters({ tessedit_pageseg_mode: a.psm });
     const { data } = await worker.recognize(a.make());
@@ -347,8 +410,9 @@ async function recognizeAsset(img) {
     const r = matchAsset(text);
     if (r && r.asset) return { result: r, texts };
     if (r && r.ambiguous) ambiguous = ambiguous || r;
+    near = near || nearMatch(text);
   }
-  return { result: ambiguous, texts };
+  return { result: ambiguous || near, texts };
 }
 
 /* ---------- 上傳流程 ---------- */
@@ -363,9 +427,9 @@ function setResult(type, msg) {
 }
 function closeResult() {
   clearTimeout(resultTimer);
+  pendingManual = null;
+  $('#manual-box').classList.add('hidden');
   $('#result-panel').classList.add('hidden');
-  $('#ocr-detail').classList.add('hidden');
-  $('#ocr-detail').open = false;
   const pv = $('#preview');
   if (pv.src.startsWith('blob:')) URL.revokeObjectURL(pv.src);
   pv.removeAttribute('src');
@@ -382,34 +446,68 @@ async function handleFile(file) {
 
     setResult('processing', '🔍 辨識資產編號中…');
     const { result: m, texts } = await recognizeAsset(img);
-    const text = texts.join('\n');
-    $('#ocr-text').textContent = text || '（未辨識到文字）';
-    $('#ocr-detail').classList.remove('hidden');
+    const text = texts.join('\n'); // 不顯示在畫面，只寫入 Drive 照片描述供追查
 
-    if (!m) {
-      setResult('fail', `❌ 找不到清單中的 ${PREFIX} 資產編號，請重新上傳（請對準標籤、避免反光與模糊）`);
+    if (m && m.asset) {
+      await uploadAsset(m.asset, img, text, m.code);
       return;
     }
-    if (m.ambiguous) {
-      setResult('fail', `❌ 無法確定是哪一筆（${m.ambiguous.join('、')}），請拍近一點重新上傳`);
-      return;
+    // 辨識不到 → 讓使用者自己選擇資產後上傳
+    if (m && m.near) {
+      showManual(img, text, m.near.assetId,
+        `⚠️ 讀到 ${m.read}，最接近您的 ${m.near.assetId}。請對照標籤確認後上傳，或重新拍照`);
+    } else if (m && m.ambiguous) {
+      showManual(img, text, '', `⚠️ 無法確定是哪一筆（${m.ambiguous.join('、')}），請選擇資產後上傳，或重新拍照`);
+    } else {
+      showManual(img, text, '', '❌ 無法辨識資產編號。請選擇這張照片對應的資產後上傳，或重新拍照');
     }
-
-    const hit = m.asset;
-    const already = isDone(hit);
-    setResult('processing', `✔ 辨識到 ${m.code}，照片上傳中…`);
-    const r = await api('upload', { assetId: hit.assetId, imageBase64: compress(img), ocrText: text });
-
-    hit.status = '已盤點';
-    hit.time = r.time;
-    hit.photoUrl = r.fileUrl;
-    renderTable(hit.assetId);
-    setResult('success', `✅ ${hit.assetId}${hit.name ? `（${hit.name}）` : ''} 盤點完成${already ? '（已更新照片）' : ''}`);
   } catch (e) {
     setResult('fail', '⚠️ 發生錯誤：' + e.message + '，請重新上傳');
   } finally {
     busy = false;
     $('#file-input').value = '';
+  }
+}
+
+async function uploadAsset(hit, img, text, code) {
+  const already = isDone(hit);
+  setResult('processing', `✔ 辨識到 ${code}，照片上傳中…`);
+  const r = await api('upload', { assetId: hit.assetId, imageBase64: compress(img), ocrText: text });
+  hit.status = '已盤點';
+  hit.time = r.time;
+  hit.photoUrl = r.fileUrl;
+  renderTable(hit.assetId);
+  setResult('success', `✅ ${hit.assetId}${hit.name ? `（${hit.name}）` : ''} 盤點完成${already ? '（已更新照片）' : ''}`);
+}
+
+/* ---------- 手動關聯資產 ---------- */
+let pendingManual = null; // { img, text }
+function showManual(img, text, preselect, msg) {
+  setResult('warn', msg);
+  pendingManual = { img, text };
+  // 未盤點的排前面，已盤點的標示出來（選了就是更新照片）
+  const sorted = [...assets].sort((a, b) => isDone(a) - isDone(b));
+  $('#manual-select').innerHTML =
+    `<option value="">— 選擇資產 —</option>` +
+    sorted.map((a) => `<option value="${escapeHtml(a.assetId)}">${escapeHtml(a.assetId)}${a.name ? '　' + escapeHtml(a.name) : ''}${isDone(a) ? '（已盤點）' : ''}</option>`).join('');
+  $('#manual-select').value = preselect || '';
+  $('#btn-manual-upload').disabled = !preselect;
+  $('#manual-box').classList.remove('hidden');
+}
+async function manualUpload() {
+  const id = $('#manual-select').value;
+  const hit = assets.find((a) => a.assetId === id);
+  const p = pendingManual;
+  if (!hit || !p || busy) return;
+  pendingManual = null;
+  $('#manual-box').classList.add('hidden');
+  busy = true;
+  try {
+    await uploadAsset(hit, p.img, p.text + `\n[手動關聯] ${hit.assetId}`, hit.assetId);
+  } catch (e) {
+    setResult('fail', '⚠️ 發生錯誤：' + e.message + '，請重新上傳');
+  } finally {
+    busy = false;
   }
 }
 
@@ -419,6 +517,8 @@ window.addEventListener('DOMContentLoaded', () => {
   $('#btn-refresh').addEventListener('click', startInventory);
   $('#btn-logout').addEventListener('click', () => logout());
   $('#btn-close-result').addEventListener('click', closeResult);
+  $('#manual-select').addEventListener('change', (e) => { $('#btn-manual-upload').disabled = !e.target.value; });
+  $('#btn-manual-upload').addEventListener('click', manualUpload);
   $('#file-input').addEventListener('change', (e) => handleFile(e.target.files[0]));
 
   session = loadSession();
