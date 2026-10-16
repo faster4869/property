@@ -50,10 +50,16 @@
             <h2>拍照盤點</h2>
             <span id="progress" class="badge"></span>
           </div>
-          <label class="upload">
-            <input id="file-input" type="file" accept="image/*" capture="environment">
-            <span>📷 拍照 / 上傳資產標籤照片</span>
-          </label>
+          <div class="upload-row">
+            <label class="upload">
+              <input id="file-camera" type="file" accept="image/*" capture="environment">
+              <span>📷 拍照</span>
+            </label>
+            <label class="upload">
+              <input id="file-gallery" type="file" accept="image/*">
+              <span>🖼️ 從相簿選擇</span>
+            </label>
+          </div>
           <div id="result-panel" class="result-panel hidden">
             <div id="result" class="result">
               <span id="result-text"></span>
@@ -84,6 +90,21 @@
       </div>
     </main>
   </section>
+
+  <!-- 照片檢視 -->
+  <div id="photo-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="photo-title">
+    <div class="modal-card">
+      <div class="row-between">
+        <div>
+          <strong id="photo-title"></strong>
+          <div id="photo-meta" class="muted small"></div>
+        </div>
+        <button id="btn-close-photo" class="close-btn" type="button" aria-label="關閉">✕</button>
+      </div>
+      <p id="photo-msg" class="muted"></p>
+      <img id="photo-img" class="modal-img hidden" alt="盤點照片">
+    </div>
+  </div>
 
   <div id="loading" class="loading hidden"><div class="spinner"></div><span id="loading-text">處理中…</span></div>
 </body>

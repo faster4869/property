@@ -143,7 +143,7 @@ function renderTable(flashId) {
       <td>${escapeHtml(a.name)}</td>
       <td><span class="status ${isDone(a) ? 'ok' : 'todo'}">${isDone(a) ? '已盤點' : '未盤點'}</span></td>
       <td>${escapeHtml(a.time)}</td>
-      <td>${a.photoUrl ? `<a href="${escapeHtml(a.photoUrl)}" target="_blank" rel="noopener">查看</a>` : ''}</td>
+      <td>${a.photoUrl ? `<button class="link-btn" data-photo="${escapeHtml(a.assetId)}" type="button">查看</button>` : ''}</td>
     </tr>`).join('');
 }
 
@@ -465,20 +465,49 @@ async function handleFile(file) {
     setResult('fail', '⚠️ 發生錯誤：' + e.message + '，請重新上傳');
   } finally {
     busy = false;
-    $('#file-input').value = '';
   }
 }
 
 async function uploadAsset(hit, img, text, code) {
   const already = isDone(hit);
   setResult('processing', `✔ 辨識到 ${code}，照片上傳中…`);
-  const r = await api('upload', { assetId: hit.assetId, imageBase64: compress(img), ocrText: text });
+  const b64 = compress(img);
+  const r = await api('upload', { assetId: hit.assetId, imageBase64: b64, ocrText: text });
+  photoCache.set(hit.assetId, 'data:image/jpeg;base64,' + b64); // 剛上傳的照片不用再下載
   hit.status = '已盤點';
   hit.time = r.time;
   hit.photoUrl = r.fileUrl;
   renderTable(hit.assetId);
   setResult('success', `✅ ${hit.assetId}${hit.name ? `（${hit.name}）` : ''} 盤點完成${already ? '（已更新照片）' : ''}`);
 }
+
+/* ---------- 查看照片 ----------
+ * Drive 不共用，照片經由後端驗證後取得，只能看自己名下資產的照片
+ */
+const photoCache = new Map(); // assetId → dataURL
+async function viewPhoto(assetId) {
+  const a = assets.find((x) => x.assetId === assetId);
+  $('#photo-title').textContent = assetId + (a && a.name ? '　' + a.name : '');
+  $('#photo-meta').textContent = a && a.time ? '盤點時間：' + a.time : '';
+  $('#photo-img').removeAttribute('src');
+  $('#photo-img').classList.add('hidden');
+  $('#photo-msg').textContent = '照片載入中…';
+  $('#photo-msg').classList.remove('hidden');
+  $('#photo-modal').classList.remove('hidden');
+  try {
+    if (!photoCache.has(assetId)) {
+      const p = await api('photo', { assetId });
+      photoCache.set(assetId, `data:${p.mime};base64,${p.base64}`);
+    }
+    if ($('#photo-modal').classList.contains('hidden')) return; // 載入途中已關閉
+    $('#photo-img').src = photoCache.get(assetId);
+    $('#photo-img').classList.remove('hidden');
+    $('#photo-msg').classList.add('hidden');
+  } catch (e) {
+    $('#photo-msg').textContent = '⚠️ ' + e.message;
+  }
+}
+function closePhoto() { $('#photo-modal').classList.add('hidden'); }
 
 /* ---------- 手動關聯資產 ---------- */
 let pendingManual = null; // { img, text }
@@ -519,7 +548,16 @@ window.addEventListener('DOMContentLoaded', () => {
   $('#btn-close-result').addEventListener('click', closeResult);
   $('#manual-select').addEventListener('change', (e) => { $('#btn-manual-upload').disabled = !e.target.value; });
   $('#btn-manual-upload').addEventListener('click', manualUpload);
-  $('#file-input').addEventListener('change', (e) => handleFile(e.target.files[0]));
+  $('#asset-body').addEventListener('click', (e) => {
+    const b = e.target.closest('[data-photo]');
+    if (b) viewPhoto(b.dataset.photo);
+  });
+  $('#btn-close-photo').addEventListener('click', closePhoto);
+  $('#photo-modal').addEventListener('click', (e) => { if (e.target.id === 'photo-modal') closePhoto(); });
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closePhoto(); });
+  for (const id of ['#file-camera', '#file-gallery']) {
+    $(id).addEventListener('change', (e) => { handleFile(e.target.files[0]); e.target.value = ''; });
+  }
 
   session = loadSession();
   if (session) enterMain(); else showLogin();
