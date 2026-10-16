@@ -166,32 +166,115 @@ function loadImage(file) {
     img.src = URL.createObjectURL(file);
   });
 }
-// 灰階 + 對比拉伸，提升標籤文字辨識率
-function preprocess(img) {
-  const longSide = Math.max(img.naturalWidth, img.naturalHeight);
-  const scale = Math.min(2000 / longSide, Math.max(1, 1200 / longSide));
-  const c = document.createElement('canvas');
-  c.width = Math.round(img.naturalWidth * scale);
-  c.height = Math.round(img.naturalHeight * scale);
+/* ---------- 影像前處理 ---------- */
+// 灰階 + 對比拉伸（忽略最暗/最亮各 1% 的像素，避免反光點影響）
+function enhance(c) {
   const ctx = c.getContext('2d');
-  ctx.drawImage(img, 0, 0, c.width, c.height);
   const d = ctx.getImageData(0, 0, c.width, c.height);
-  const px = d.data;
-  let min = 255, max = 0;
-  const gray = new Uint8ClampedArray(px.length / 4);
-  for (let i = 0, j = 0; i < px.length; i += 4, j++) {
+  const px = d.data, n = px.length / 4;
+  const gray = new Uint8ClampedArray(n), hist = new Uint32Array(256);
+  for (let i = 0, j = 0; j < n; i += 4, j++) {
     const g = 0.299 * px[i] + 0.587 * px[i + 1] + 0.114 * px[i + 2];
-    gray[j] = g;
-    if (g < min) min = g;
-    if (g > max) max = g;
+    gray[j] = g; hist[gray[j]]++;
   }
-  const range = Math.max(1, max - min);
-  for (let i = 0, j = 0; i < px.length; i += 4, j++) {
-    const v = ((gray[j] - min) / range) * 255;
-    px[i] = px[i + 1] = px[i + 2] = v;
+  let lo = 0, hi = 255, acc = 0;
+  for (; lo < 255; lo++) { acc += hist[lo]; if (acc > n * 0.01) break; }
+  for (acc = 0; hi > 0; hi--) { acc += hist[hi]; if (acc > n * 0.01) break; }
+  const range = Math.max(1, hi - lo);
+  for (let i = 0, j = 0; j < n; i += 4, j++) {
+    const v = ((gray[j] - lo) / range) * 255;
+    px[i] = px[i + 1] = px[i + 2] = v < 0 ? 0 : v > 255 ? 255 : v;
   }
   ctx.putImageData(d, 0, 0);
   return c;
+}
+// 從原圖裁一塊 (sx,sy,sw,sh)，縮放到指定高度，四周補白邊
+function cropCanvas(img, sx, sy, sw, sh, targetH, pad = 20) {
+  const s = targetH / sh;
+  const c = document.createElement('canvas');
+  c.width = Math.round(sw * s) + pad * 2;
+  c.height = Math.round(sh * s) + pad * 2;
+  const ctx = c.getContext('2d');
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(0, 0, c.width, c.height);
+  ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(img, sx, sy, sw, sh, pad, pad, c.width - pad * 2, c.height - pad * 2);
+  return enhance(c);
+}
+// 整張照片（長邊約 1200～2000px）
+function fullCanvas(img) {
+  const longSide = Math.max(img.naturalWidth, img.naturalHeight);
+  const s = Math.min(2000 / longSide, Math.max(1, 1200 / longSide));
+  const c = document.createElement('canvas');
+  c.width = Math.round(img.naturalWidth * s);
+  c.height = Math.round(img.naturalHeight * s);
+  c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+  return enhance(c);
+}
+
+// 用顏色找出黃色資產標籤，回傳在縮圖上的外框 {x,y,w,h}
+function findLabelBox(px, w, h) {
+  const mask = new Uint8Array(w * h);
+  for (let i = 0, j = 0; j < w * h; i += 4, j++) {
+    const r = px[i], g = px[i + 1], b = px[i + 2];
+    const max = Math.max(r, g, b), min = Math.min(r, g, b);
+    if (r > 130 && g > 110 && r - b > 45 && g - b > 30 && Math.abs(r - g) < 70 && (max - min) / max > 0.2) mask[j] = 1;
+  }
+  const seen = new Uint8Array(w * h), stack = [];
+  let best = null;
+  for (let s = 0; s < w * h; s++) {
+    if (!mask[s] || seen[s]) continue;
+    let x0 = w, y0 = h, x1 = 0, y1 = 0, area = 0;
+    stack.push(s); seen[s] = 1;
+    while (stack.length) {
+      const p = stack.pop(), x = p % w, y = (p / w) | 0;
+      area++;
+      if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+      const nb = [x > 0 ? p - 1 : -1, x < w - 1 ? p + 1 : -1, p - w, p + w];
+      for (const q of nb) {
+        if (q < 0 || q >= w * h || seen[q] || !mask[q]) continue;
+        seen[q] = 1; stack.push(q);
+      }
+    }
+    const bw = x1 - x0 + 1, bh = y1 - y0 + 1;
+    // 面積夠大、橫向長方形、填滿度夠，才像一張標籤
+    if (area < w * h * 0.003 || bw < bh * 1.2 || area / (bw * bh) < 0.4) continue;
+    if (!best || area > best.area) best = { x: x0, y: y0, w: bw, h: bh, area };
+  }
+  return best;
+}
+function detectLabel(img) {
+  const SW = 400, s = SW / img.naturalWidth;
+  const c = document.createElement('canvas');
+  c.width = SW; c.height = Math.round(img.naturalHeight * s);
+  const ctx = c.getContext('2d', { willReadFrequently: true });
+  ctx.drawImage(img, 0, 0, c.width, c.height);
+  const b = findLabelBox(ctx.getImageData(0, 0, c.width, c.height).data, c.width, c.height);
+  return b && { x: b.x / s, y: b.y / s, w: b.w / s, h: b.h / s }; // 換算回原圖座標
+}
+
+/**
+ * 依序產生要嘗試的 OCR 輸入：
+ * 有找到黃色標籤 → 先辨識標籤上半部的文字列（避開條碼），再辨識整張標籤
+ * 最後才退回整張照片
+ */
+function buildAttempts(img) {
+  const attempts = [];
+  const b = detectLabel(img);
+  if (b) {
+    const textRow = (H) => () => cropCanvas(img, b.x, b.y, b.w, b.h * 0.55, H);
+    attempts.push({ name: '標籤文字列', psm: '7', make: textRow(120) });
+    attempts.push({ name: '標籤文字列(小)', psm: '6', make: textRow(90) });
+    const p = b.h * 0.15;
+    const x = Math.max(0, b.x - p), y = Math.max(0, b.y - p);
+    const w = Math.min(img.naturalWidth - x, b.w + p * 2), h = Math.min(img.naturalHeight - y, b.h + p * 2);
+    attempts.push({ name: '整張標籤', psm: '6', make: () => cropCanvas(img, x, y, w, h, Math.round((1400 / w) * h)) });
+  }
+  let full = null;
+  const fullOnce = () => (full = full || fullCanvas(img));
+  attempts.push({ name: '整張照片', psm: '6', make: fullOnce });
+  attempts.push({ name: '整張照片(零散)', psm: '11', make: fullOnce });
+  return attempts;
 }
 // 壓縮成 JPEG（長邊 1600px）供上傳
 function compress(img) {
@@ -251,20 +334,21 @@ function matchAsset(text) {
   return { asset: sorted[0][0], code: PREFIX + digitPart(sorted[0][0].assetId) };
 }
 
-// 多種版面模式依序嘗試，對到就停（6=單一文字區塊，對標籤最準；11=零散文字；3=自動）
-const OCR_PASSES = ['6', '11', '3'];
-async function recognizeAsset(canvas) {
+// 依序嘗試各種裁切與版面模式，比對到就停
+async function recognizeAsset(img) {
   const worker = await getWorker();
   const texts = [];
-  for (const psm of OCR_PASSES) {
-    await worker.setParameters({ tessedit_pageseg_mode: psm });
-    const { data } = await worker.recognize(canvas);
+  let ambiguous = null;
+  for (const a of buildAttempts(img)) {
+    await worker.setParameters({ tessedit_pageseg_mode: a.psm });
+    const { data } = await worker.recognize(a.make());
     const text = data.text || '';
-    texts.push(`[模式 ${psm}] ${text.trim()}`);
+    texts.push(`[${a.name}] ${text.replace(/\s+/g, ' ').trim()}`);
     const r = matchAsset(text);
-    if (r) return { result: r, texts };
+    if (r && r.asset) return { result: r, texts };
+    if (r && r.ambiguous) ambiguous = ambiguous || r;
   }
-  return { result: null, texts };
+  return { result: ambiguous, texts };
 }
 
 /* ---------- 上傳流程 ---------- */
@@ -297,7 +381,7 @@ async function handleFile(file) {
     $('#preview').classList.remove('hidden');
 
     setResult('processing', '🔍 辨識資產編號中…');
-    const { result: m, texts } = await recognizeAsset(preprocess(img));
+    const { result: m, texts } = await recognizeAsset(img);
     const text = texts.join('\n');
     $('#ocr-text').textContent = text || '（未辨識到文字）';
     $('#ocr-detail').classList.remove('hidden');
