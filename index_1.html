@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>資產盤點</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="config.js"></script>
+  <script src="https://accounts.google.com/gsi/client" async defer></script>
+  <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js" defer></script>
+  <script src="app.js" defer></script>
+</head>
+<body>
+
+  <!-- 登入畫面 -->
+  <section id="view-login" class="view hidden">
+    <div class="login-card">
+      <div class="logo">📦</div>
+      <h1>資產盤點系統</h1>
+      <p class="muted">請使用 Google 帳號登入</p>
+      <div id="gsi-btn"></div>
+      <p id="login-error" class="error hidden"></p>
+    </div>
+  </section>
+
+  <!-- 主畫面 -->
+  <section id="view-main" class="view hidden">
+    <header class="topbar">
+      <div class="brand">📦 資產盤點</div>
+      <div class="user">
+        <img id="user-pic" alt="" referrerpolicy="no-referrer">
+        <div class="user-text">
+          <div id="user-name"></div>
+          <div id="user-email" class="muted small"></div>
+        </div>
+        <button id="btn-logout" class="btn ghost small">登出</button>
+      </div>
+    </header>
+
+    <main class="container">
+      <div class="card" id="start-card">
+        <h2>盤點清單</h2>
+        <p class="muted">讀取您名下的資產清單後，即可拍照上傳進行盤點。</p>
+        <button id="btn-start" class="btn primary">開始盤點</button>
+      </div>
+
+      <div id="inventory" class="hidden">
+        <div class="card">
+          <div class="row-between">
+            <h2>拍照盤點</h2>
+            <span id="progress" class="badge"></span>
+          </div>
+          <label class="upload">
+            <input id="file-input" type="file" accept="image/*" capture="environment">
+            <span>📷 拍照 / 上傳資產標籤照片</span>
+          </label>
+          <div id="result" class="result hidden"></div>
+          <img id="preview" class="preview hidden" alt="預覽">
+          <details id="ocr-detail" class="hidden">
+            <summary>OCR 辨識文字</summary>
+            <pre id="ocr-text"></pre>
+          </details>
+        </div>
+
+        <div class="card">
+          <div class="row-between">
+            <h2>我的資產</h2>
+            <button id="btn-refresh" class="btn ghost small">重新整理</button>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr><th>資產編號</th><th>資產名稱</th><th>狀態</th><th>盤點時間</th><th>照片</th></tr>
+              </thead>
+              <tbody id="asset-body"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </main>
+  </section>
+
+  <div id="loading" class="loading hidden"><div class="spinner"></div><span id="loading-text">處理中…</span></div>
+</body>
+</html>
