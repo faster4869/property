@@ -152,9 +152,7 @@ function getWorker() {
   if (!ocrWorker) {
     ocrWorker = (async () => {
       const w = await Tesseract.createWorker('eng');
-      await w.setParameters({
-        tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_/.',
-      });
+      await w.setParameters({ tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789' });
       return w;
     })().catch((e) => { ocrWorker = null; throw e; });
   }
@@ -206,58 +204,116 @@ function compress(img) {
 }
 
 /* ---------- 比對 ---------- */
+// 資產編號格式：PREFIX + NDIG 位數字（預設 SPTTW + 7 碼）
+const PREFIX = String(CFG.ASSET_PREFIX || 'SPTTW').toUpperCase();
+const NDIG = Number(CFG.ASSET_DIGITS) || 7;
 const norm = (s) => String(s).toUpperCase().replace(/[^A-Z0-9]/g, '');
-// 處理 OCR 常見混淆字元：O/0、I/L/1、S/5、B/8、Z/2
-const loose = (s) => norm(s).replace(/O/g, '0').replace(/[IL]/g, '1').replace(/S/g, '5').replace(/B/g, '8').replace(/Z/g, '2');
+// OCR 常把數字認成相似字母，在數字區段把它們轉回數字
+const TO_DIGIT = { O: '0', Q: '0', D: '0', U: '0', I: '1', L: '1', J: '1', Z: '2', S: '5', G: '6', T: '7', B: '8' };
+const toDigits = (s) => norm(s).replace(/[A-Z]/g, (c) => TO_DIGIT[c] || c);
+// 取資產編號的數字部分（SPTTW0003553 → 0003553）
+const digitPart = (id) => { const n = norm(id); return n.startsWith(PREFIX) ? n.slice(PREFIX.length) : n.slice(-NDIG); };
 
+/**
+ * 從 OCR 文字找出資產編號，只認「PREFIX + NDIG 碼」，且必須是自己清單中的資產。
+ * 1. 嚴格：文字中出現 SPTTW + 7 碼（數字段容錯 O→0 等）
+ * 2. 容錯：前綴常被認錯（SPTTW → SPIW、SP1TW…），改抓連續 ≥7 位的數字段，
+ *    取其中 7 碼比對清單；越靠數字段尾端的優先（前面多讀出的 0 視為雜訊）
+ * 回傳 { asset, code } / { ambiguous: [...] } / null
+ */
 function matchAsset(text) {
-  const cands = assets.filter((a) => norm(a.assetId).length >= 3);
-  const lines = text.split(/\n+/).filter((l) => l.trim());
-  const tries = [
-    (a) => lines.some((l) => norm(l).includes(norm(a.assetId))),   // 單行嚴格比對
-    (a) => lines.some((l) => loose(l).includes(loose(a.assetId))), // 單行容錯比對
-    (a) => norm(text).includes(norm(a.assetId)),                    // 跨行嚴格比對
-  ];
-  for (const t of tries) {
-    const hits = cands.filter(t);
-    if (hits.length) {
-      hits.sort((a, b) => norm(b.assetId).length - norm(a.assetId).length);
-      return hits[0];
+  const byDigits = new Map(assets.map((a) => [digitPart(a.assetId), a]));
+  const t = norm(text);
+
+  const re = new RegExp(PREFIX + '([0-9A-Z]{' + NDIG + '})', 'g');
+  for (const m of t.matchAll(re)) {
+    const hit = byDigits.get(toDigits(m[1]));
+    if (hit) return { asset: hit, code: PREFIX + digitPart(hit.assetId) };
+  }
+
+  const hits = new Map(); // asset → 分數（越小越好：距離數字段尾端幾碼）
+  for (const line of String(text).split(/\n+/)) {
+    for (const run of toDigits(line).match(/\d+/g) || []) {
+      if (run.length < NDIG) continue;
+      for (let end = run.length; end >= NDIG; end--) {
+        const a = byDigits.get(run.slice(end - NDIG, end));
+        if (!a) continue;
+        const score = run.length - end;
+        if (!hits.has(a) || hits.get(a) > score) hits.set(a, score);
+      }
     }
   }
-  return null;
+  if (!hits.size) return null;
+  const sorted = [...hits].sort((x, y) => x[1] - y[1]);
+  if (sorted.length > 1 && sorted[0][1] === sorted[1][1]) {
+    return { ambiguous: sorted.filter((s) => s[1] === sorted[0][1]).map((s) => s[0].assetId) };
+  }
+  return { asset: sorted[0][0], code: PREFIX + digitPart(sorted[0][0].assetId) };
+}
+
+// 多種版面模式依序嘗試，對到就停（6=單一文字區塊，對標籤最準；11=零散文字；3=自動）
+const OCR_PASSES = ['6', '11', '3'];
+async function recognizeAsset(canvas) {
+  const worker = await getWorker();
+  const texts = [];
+  for (const psm of OCR_PASSES) {
+    await worker.setParameters({ tessedit_pageseg_mode: psm });
+    const { data } = await worker.recognize(canvas);
+    const text = data.text || '';
+    texts.push(`[模式 ${psm}] ${text.trim()}`);
+    const r = matchAsset(text);
+    if (r) return { result: r, texts };
+  }
+  return { result: null, texts };
 }
 
 /* ---------- 上傳流程 ---------- */
+let resultTimer = null;
 function setResult(type, msg) {
-  const el = $('#result');
-  el.className = `result ${type}`;
-  el.textContent = msg;
+  clearTimeout(resultTimer);
+  $('#result').className = `result ${type}`;
+  $('#result-text').textContent = msg;
+  $('#result-panel').classList.remove('hidden');
+  // 成功訊息 4 秒後自動收起；失敗訊息留著讓使用者看清楚，手動關閉
+  if (type === 'success') resultTimer = setTimeout(closeResult, 4000);
+}
+function closeResult() {
+  clearTimeout(resultTimer);
+  $('#result-panel').classList.add('hidden');
+  $('#ocr-detail').classList.add('hidden');
+  $('#ocr-detail').open = false;
+  const pv = $('#preview');
+  if (pv.src.startsWith('blob:')) URL.revokeObjectURL(pv.src);
+  pv.removeAttribute('src');
+  pv.classList.add('hidden');
 }
 async function handleFile(file) {
   if (!file || busy) return;
   busy = true;
-  $('#ocr-detail').classList.add('hidden');
+  closeResult(); // 清掉上一次的結果
   try {
     const img = await loadImage(file);
     $('#preview').src = img.src;
     $('#preview').classList.remove('hidden');
 
     setResult('processing', '🔍 辨識資產編號中…');
-    const worker = await getWorker();
-    const { data } = await worker.recognize(preprocess(img));
-    const text = data.text || '';
-    $('#ocr-text').textContent = text.trim() || '（未辨識到文字）';
+    const { result: m, texts } = await recognizeAsset(preprocess(img));
+    const text = texts.join('\n');
+    $('#ocr-text').textContent = text || '（未辨識到文字）';
     $('#ocr-detail').classList.remove('hidden');
 
-    const hit = matchAsset(text);
-    if (!hit) {
-      setResult('fail', '❌ 比對失敗，請重新上傳（請對準資產標籤、避免反光與模糊）');
+    if (!m) {
+      setResult('fail', `❌ 找不到清單中的 ${PREFIX} 資產編號，請重新上傳（請對準標籤、避免反光與模糊）`);
+      return;
+    }
+    if (m.ambiguous) {
+      setResult('fail', `❌ 無法確定是哪一筆（${m.ambiguous.join('、')}），請拍近一點重新上傳`);
       return;
     }
 
+    const hit = m.asset;
     const already = isDone(hit);
-    setResult('processing', `✔ 辨識到 ${hit.assetId}，照片上傳中…`);
+    setResult('processing', `✔ 辨識到 ${m.code}，照片上傳中…`);
     const r = await api('upload', { assetId: hit.assetId, imageBase64: compress(img), ocrText: text });
 
     hit.status = '已盤點';
@@ -278,6 +334,7 @@ window.addEventListener('DOMContentLoaded', () => {
   $('#btn-start').addEventListener('click', startInventory);
   $('#btn-refresh').addEventListener('click', startInventory);
   $('#btn-logout').addEventListener('click', () => logout());
+  $('#btn-close-result').addEventListener('click', closeResult);
   $('#file-input').addEventListener('change', (e) => handleFile(e.target.files[0]));
 
   session = loadSession();

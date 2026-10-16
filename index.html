@@ -54,12 +54,17 @@
             <input id="file-input" type="file" accept="image/*" capture="environment">
             <span>📷 拍照 / 上傳資產標籤照片</span>
           </label>
-          <div id="result" class="result hidden"></div>
-          <img id="preview" class="preview hidden" alt="預覽">
-          <details id="ocr-detail" class="hidden">
-            <summary>OCR 辨識文字</summary>
-            <pre id="ocr-text"></pre>
-          </details>
+          <div id="result-panel" class="result-panel hidden">
+            <div id="result" class="result">
+              <span id="result-text"></span>
+              <button id="btn-close-result" class="close-btn" type="button" aria-label="關閉" title="關閉">✕</button>
+            </div>
+            <img id="preview" class="preview hidden" alt="預覽">
+            <details id="ocr-detail" class="hidden">
+              <summary>OCR 辨識文字</summary>
+              <pre id="ocr-text"></pre>
+            </details>
+          </div>
         </div>
 
         <div class="card">
