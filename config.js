@@ -4,7 +4,7 @@ window.APP_CONFIG = {
   GOOGLE_CLIENT_ID: '884314576750-0ar18p2elfjn6jd287ded3112nhcnmru.apps.googleusercontent.com',
 
   // Apps Script 部署為「網頁應用程式」後取得的網址（結尾為 /exec）
-  GAS_URL: 'https://script.google.com/macros/s/AKfycbwtN0PuLHzyV-AgFmpZq-QEAPsV0tE87Okrk3RLpEGrPpkgFlz8QTUdXa92IWSHHiTF/exec',
+  GAS_URL: 'https://script.google.com/macros/s/AKfycbw3ZX0WphWT8OiwSXXcNdQaRxvpH-3zcEs1Q_Ac2g0jgLrDrruXz7d01ISnoW4DRyaO/exec',
 
   // 限定登入網域，例如 'shopee.com'；留空表示不限制（後端也會再檢查一次）
   ALLOWED_DOMAIN: '',
